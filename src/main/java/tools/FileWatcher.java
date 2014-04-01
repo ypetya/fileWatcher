@@ -2,53 +2,48 @@ package tools;
 
 import java.io.IOException;
 import java.nio.file.FileSystem;
-import java.nio.file.FileVisitResult;
-import java.nio.file.Files;
-import static java.nio.file.LinkOption.NOFOLLOW_LINKS;
 import java.nio.file.Path;
-import java.nio.file.SimpleFileVisitor;
 import static java.nio.file.StandardWatchEventKinds.*;
 import java.nio.file.WatchEvent;
 import java.nio.file.WatchKey;
 import java.nio.file.WatchService;
-import java.nio.file.attribute.BasicFileAttributes;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.Arrays;
+import java.util.LinkedList;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class FileWatcher implements Runnable {
 
     private Path root;
+    private String commandToExecute;
+    private String[] skipDirectories;
+
     @SuppressWarnings("NonConstantLogger")
     private final Logger logger;
     private final WatchService watcher;
-    private final Map<WatchKey, Path> keys;
+
     private final Factory factory;
     private final FileSystem fileSystem;
+    private final Registry registry;
 
     FileWatcher(Factory factory) throws IOException {
         this.factory = factory;
         logger = factory.createLogger(this.getClass());
         fileSystem = factory.getFileSystem();
         watcher = fileSystem.newWatchService();
-        keys = new HashMap<>();
-    }
-
-    @SuppressWarnings("unchecked")
-    private static <T> WatchEvent<T> cast(WatchEvent<?> event) {
-        return (WatchEvent<T>) event;
+        registry = factory.createRegistry(watcher);
+        factory.registerMBeans(registry);
     }
 
     @Override
     @SuppressWarnings({"BroadCatchBlock", "TooBroadCatch"})
     public void run() {
-        if (registerWatchers(root)) {
+        if (registry.registerWatchers(root)) {
             try {
                 while (true) {
                     WatchKey key = watcher.take();
 
-                    if (checkWatchKeyIsADirectory(key)) {
+                    if (registry.checkHasADirectory(key)) {
                         handleEvents(key);
                         cleanUp(key);
                     }
@@ -59,31 +54,76 @@ public class FileWatcher implements Runnable {
         }
     }
 
-    boolean checkWatchKeyIsADirectory(WatchKey key) {
-        Path dir = keys.get(key);
-        if (dir == null) {
-            logger.severe(String.format("Watchkey not found! %s", key));
-            return false;
+    void handleEvents(WatchKey key) {
+        Path dir = registry.get(key);
+        for (WatchEvent<?> event : key.pollEvents()) {
+            WatchEvent.Kind kind = event.kind();
+
+            // TBD - provide example of how OVERFLOW event is handled
+            if (kind == OVERFLOW) {
+                continue;
+            }
+
+            // Context for directory entry event is the file name of entry
+            WatchEvent<Path> ev = Factory.cast(event);
+            Path name = ev.context();
+            Path child = dir.resolve(name);
+
+            logger.info(String.format("%s: %s\n", event.kind().name(), child));
+            if (commandToExecute != null) {
+                try {
+                    factory.execute(commandToExecute, root, child);
+                } catch (IOException ex) {
+                    logger.log(Level.SEVERE, "Could not execute command : "
+                            + commandToExecute, ex);
+                }
+            }
+
+            // if directory is created, and watching recursively, then
+            // register it and its sub-directories
+            if (kind == ENTRY_CREATE) {
+                if (factory.isDirectory(child)) {
+                    registry.registerWatchers(child);
+                }
+            }
         }
-        return true;
     }
 
     void cleanUp(WatchKey key) {
         // reset key and remove from set if directory no longer accessible
         if (!key.reset()) {
-            keys.remove(key);
-
-            // 
-            if (keys.isEmpty()) {
-                throw new RuntimeException("All directories are inaccessible");
+            registry.remove(key);
+            if (registry.getKeys().isEmpty()) {
+                throw new IllegalStateException("All directories are inaccessible");
             }
         }
     }
 
     void setupByCommandLineArguments(String[] args) {
         String pathToWatch = ".";
-        if (args != null && args.length > 0) {
-            pathToWatch = args[0];
+        if (args != null) {
+            if (args.length == 1) {
+                pathToWatch = args[0];
+            } else {
+                LinkedList<String> largs = new LinkedList(Arrays.asList(args));
+                while (!largs.isEmpty()) {
+                    switch (largs.remove()) {
+                        case "-d":
+                            pathToWatch = largs.remove();
+                            break;
+                        case "-c":
+                            commandToExecute = largs.remove();
+                            logger.info("Command to execute : " + commandToExecute);
+                            break;
+                        case "--skipDirectories":
+                            skipDirectories = largs.remove().split(",");
+                            logger.info("Skip Directories : " + skipDirectories);
+                            break;
+                        default:
+                            throw new IllegalArgumentException("Invalid switch!");
+                    }
+                }
+            }
         }
         root = fileSystem.getPath(pathToWatch);
     }
@@ -95,78 +135,27 @@ public class FileWatcher implements Runnable {
         t.join();
     }
 
-    private void register(Path rootAll) throws IOException {
-        Files.walkFileTree(rootAll, new SimpleFileVisitor<Path>() {
-
-            @Override
-            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
-                WatchKey key = dir.register(watcher, ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY);
-                keys.put(key, dir);
-                return FileVisitResult.CONTINUE;
-            }
-
-        });
-    }
-
-    boolean registerWatchers(Path subDir) {
-        try {
-            logger.info(String.format("Start watching %s", subDir.toString()));
-            register(subDir);
-            return true;
-        } catch (IOException ex) {
-            logger.log(Level.SEVERE, "Exception at registering directory watchers.", ex);
-        }
-        return false;
-    }
-
-    void handleEvents(WatchKey key) {
-        Path dir = keys.get(key);
-        for (WatchEvent<?> event : key.pollEvents()) {
-            WatchEvent.Kind kind = event.kind();
-
-            // TBD - provide example of how OVERFLOW event is handled
-            if (kind == OVERFLOW) {
-                continue;
-            }
-
-            // Context for directory entry event is the file name of entry
-            WatchEvent<Path> ev = cast(event);
-            Path name = ev.context();
-            Path child = dir.resolve(name);
-
-            logger.info(String.format("%s: %s\n", event.kind().name(), child));
-
-            // if directory is created, and watching recursively, then
-            // register it and its sub-directories
-            if (kind == ENTRY_CREATE) {
-                if (Files.isDirectory(child, NOFOLLOW_LINKS)) {
-                    registerWatchers(child);
-                }
-            }
-        }
-    }
-
     Path getRoot() {
         return root;
+    }
+
+    String getCommandToExecute() {
+        return commandToExecute;
+    }
+
+    Logger getLogger() {
+        return logger;
     }
 
     WatchService getWatcher() {
         return watcher;
     }
 
-    Map<WatchKey, Path> getKeys() {
-        return keys;
-    }
-
     FileSystem getFileSystem() {
         return fileSystem;
     }
-    
+
     Factory getFactory() {
         return factory;
-    }
-
-    Logger getLogger() {
-        return logger;
     }
 }
